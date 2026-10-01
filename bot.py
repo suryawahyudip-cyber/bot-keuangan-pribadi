@@ -34,6 +34,7 @@ sheet = gc.open_by_key(SHEET_ID)
 ws_transaksi = sheet.worksheet("Transaksi")
 ws_kategori = sheet.worksheet("Kategori")
 ws_akun = sheet.worksheet("Akun")
+ws_ringkasan = sheet.worksheet("Ringkasan Bulanan")
 
 
 def ambil_daftar(worksheet, kolom):
@@ -113,14 +114,84 @@ def simpan_ke_sheet(data):
     ws_transaksi.update_cell(baris_baru, 7, data["deskripsi"])
 
 
+def format_rp(angka):
+    try:
+        angka = float(angka)
+    except (TypeError, ValueError):
+        angka = 0
+    tanda = "-" if angka < 0 else ""
+    return f"{tanda}Rp{abs(angka):,.0f}"
+
+
 # --- Handler bot Telegram ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Halo! Kirim transaksi dengan format:\n"
         "<kategori> <jumlah> <akun> <deskripsi opsional>\n\n"
-        "Contoh: makan 15000 bca beli nasi goreng"
+        "Contoh: makan 15000 bca beli nasi goreng\n\n"
+        "Command lain:\n"
+        "/saldo - cek saldo semua akun\n"
+        "/ringkasan - rekap bulan ini"
     )
+
+
+async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        nama_list = ws_akun.col_values(1)[4:]  # mulai baris 5
+        saldo_list = ws_akun.col_values(3, value_render_option="UNFORMATTED_VALUE")[4:]
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal ambil data saldo: {e}")
+        return
+
+    baris = []
+    total = 0
+    for nama, saldo in zip(nama_list, saldo_list):
+        if not nama.strip():
+            continue
+        nilai = saldo if isinstance(saldo, (int, float)) else 0
+        total += nilai
+        baris.append(f"• {nama}: {format_rp(nilai)}")
+
+    if not baris:
+        await update.message.reply_text("Belum ada akun yang terdaftar di sheet Akun.")
+        return
+
+    pesan = "💰 Saldo Akun:\n" + "\n".join(baris) + f"\n\nTotal: {format_rp(total)}"
+    await update.message.reply_text(pesan)
+
+
+async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    baris_bulan_ini = 5  # baris pertama di Ringkasan Bulanan selalu bulan berjalan (formula pakai TODAY())
+    try:
+        bulan_label = ws_ringkasan.cell(baris_bulan_ini, 1).value
+        nilai = ws_ringkasan.row_values(baris_bulan_ini, value_render_option="UNFORMATTED_VALUE")
+        headers = ws_ringkasan.row_values(4)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal ambil ringkasan: {e}")
+        return
+
+    pemasukan = nilai[1] if len(nilai) > 1 else 0
+    pengeluaran = nilai[2] if len(nilai) > 2 else 0
+    saldo_bersih = nilai[3] if len(nilai) > 3 else 0
+
+    baris_kategori = []
+    for i in range(4, len(headers)):
+        nama_kategori = headers[i]
+        nilai_kategori = nilai[i] if i < len(nilai) else 0
+        if isinstance(nilai_kategori, (int, float)) and nilai_kategori:
+            baris_kategori.append(f"• {nama_kategori}: {format_rp(nilai_kategori)}")
+
+    pesan = (
+        f"📊 Ringkasan {bulan_label}\n\n"
+        f"Pemasukan: {format_rp(pemasukan)}\n"
+        f"Pengeluaran: {format_rp(pengeluaran)}\n"
+        f"Saldo Bersih: {format_rp(saldo_bersih)}"
+    )
+    if baris_kategori:
+        pesan += "\n\nPer Kategori:\n" + "\n".join(baris_kategori)
+
+    await update.message.reply_text(pesan)
 
 
 async def catat_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -146,6 +217,8 @@ async def catat_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("saldo", cmd_saldo))
+    app.add_handler(CommandHandler("ringkasan", cmd_ringkasan))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catat_transaksi))
 
     print("Bot berjalan... tekan Ctrl+C untuk berhenti.")
