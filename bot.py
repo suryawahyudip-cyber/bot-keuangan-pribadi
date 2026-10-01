@@ -5,7 +5,7 @@
 
 import os
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -52,40 +52,59 @@ def cari_kecocokan(kata, daftar):
     return None
 
 
+def cari_kategori_di_awal(teks_lower, daftar_kategori):
+    """Cari kategori (bisa lebih dari satu kata, mis. 'Belanja Kebutuhan') di awal teks.
+    Kategori dengan jumlah kata terbanyak dicek duluan supaya 'Belanja Kebutuhan'
+    tidak keburu kecocok sebagai 'Belanja' saja."""
+    terurut = sorted(daftar_kategori, key=lambda k: -len(k.split()))
+    for kat in terurut:
+        kat_lower = kat.lower()
+        if teks_lower == kat_lower or teks_lower.startswith(kat_lower + " "):
+            return kat
+    return None
+
+
 def parse_pesan(teks):
     """Ubah teks pesan jadi data transaksi. Return (data_dict, None) kalau sukses,
     atau (None, pesan_error) kalau gagal."""
-    bagian = teks.strip().split(maxsplit=3)
-    if len(bagian) < 3:
+    teks_asli = teks.strip()
+    teks_lower = teks_asli.lower()
+
+    # Cocokkan kategori dulu (boleh terdiri dari beberapa kata) - cek pengeluaran, lalu pemasukan
+    daftar_pengeluaran = ambil_daftar(ws_kategori, 1)  # kolom A
+    daftar_pemasukan = ambil_daftar(ws_kategori, 3)    # kolom C
+
+    kategori_cocok = cari_kategori_di_awal(teks_lower, daftar_pengeluaran)
+    if kategori_cocok:
+        tipe = "Out"
+    else:
+        kategori_cocok = cari_kategori_di_awal(teks_lower, daftar_pemasukan)
+        tipe = "In" if kategori_cocok else None
+
+    if not kategori_cocok:
+        kata_pertama = teks_asli.split(maxsplit=1)[0] if teks_asli else "(kosong)"
+        return None, (
+            f"Kategori '{kata_pertama}' tidak dikenali.\n"
+            f"Kategori pengeluaran: {', '.join(daftar_pengeluaran)}\n"
+            f"Sumber pemasukan: {', '.join(daftar_pemasukan)}"
+        )
+
+    # Sisa teks setelah kategori = jumlah, akun, deskripsi
+    sisa_teks = teks_asli[len(kategori_cocok):].strip()
+    bagian = sisa_teks.split(maxsplit=2)
+    if len(bagian) < 2:
         return None, (
             "Format pesan kurang lengkap.\n"
             "Contoh: makan 15000 bca beli nasi goreng"
         )
 
-    kategori_input, jumlah_input, akun_input = bagian[0], bagian[1], bagian[2]
-    deskripsi = bagian[3] if len(bagian) > 3 else ""
+    jumlah_input, akun_input = bagian[0], bagian[1]
+    deskripsi = bagian[2] if len(bagian) > 2 else ""
 
     jumlah_bersih = jumlah_input.replace(".", "").replace(",", "")
     if not jumlah_bersih.isdigit():
         return None, f"'{jumlah_input}' bukan angka yang valid untuk jumlah."
     jumlah = int(jumlah_bersih)
-
-    daftar_pengeluaran = ambil_daftar(ws_kategori, 1)  # kolom A
-    daftar_pemasukan = ambil_daftar(ws_kategori, 3)    # kolom C
-
-    kategori_cocok = cari_kecocokan(kategori_input, daftar_pengeluaran)
-    if kategori_cocok:
-        tipe = "Out"
-    else:
-        kategori_cocok = cari_kecocokan(kategori_input, daftar_pemasukan)
-        tipe = "In" if kategori_cocok else None
-
-    if not kategori_cocok:
-        return None, (
-            f"Kategori '{kategori_input}' tidak dikenali.\n"
-            f"Kategori pengeluaran: {', '.join(daftar_pengeluaran)}\n"
-            f"Sumber pemasukan: {', '.join(daftar_pemasukan)}"
-        )
 
     daftar_akun = ambil_daftar(ws_akun, 1)  # kolom A
     akun_cocok = cari_kecocokan(akun_input, daftar_akun)
@@ -132,7 +151,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Contoh: makan 15000 bca beli nasi goreng\n\n"
         "Command lain:\n"
         "/saldo - cek saldo semua akun\n"
-        "/ringkasan - rekap bulan ini"
+        "/ringkasan - rekap bulan ini\n"
+        "/hariini - transaksi hari ini"
     )
 
 
@@ -194,6 +214,76 @@ async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(pesan)
 
 
+def serial_ke_tanggal(nilai):
+    """Google Sheets menyimpan tanggal sebagai 'serial number' (hari sejak 30 Des 1899).
+    Fungsi ini mengubahnya balik jadi objek date Python, apa pun bentuk nilainya."""
+    if isinstance(nilai, (int, float)):
+        return date(1899, 12, 30) + timedelta(days=int(nilai))
+    if isinstance(nilai, str) and nilai.strip():
+        teks = nilai.strip()
+        try:
+            return date.fromisoformat(teks)
+        except ValueError:
+            pass
+        try:
+            d, m, y = teks.split("/")
+            return date(int(y), int(m), int(d))
+        except Exception:
+            return None
+    return None
+
+
+async def cmd_hariini(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        kolom_tanggal = ws_transaksi.col_values(1, value_render_option="UNFORMATTED_VALUE")[4:]
+        kolom_tipe = ws_transaksi.col_values(3)[4:]
+        kolom_kategori = ws_transaksi.col_values(4)[4:]
+        kolom_akun = ws_transaksi.col_values(5)[4:]
+        kolom_jumlah = ws_transaksi.col_values(6, value_render_option="UNFORMATTED_VALUE")[4:]
+        kolom_deskripsi = ws_transaksi.col_values(7)[4:]
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal ambil data transaksi: {e}")
+        return
+
+    hari_ini = date.today()
+    baris_hasil = []
+    total_in = 0
+    total_out = 0
+
+    jumlah_baris = len(kolom_tanggal)
+    for i in range(jumlah_baris):
+        tanggal = serial_ke_tanggal(kolom_tanggal[i])
+        if tanggal != hari_ini:
+            continue
+
+        tipe = kolom_tipe[i] if i < len(kolom_tipe) else ""
+        kategori = kolom_kategori[i] if i < len(kolom_kategori) else ""
+        akun = kolom_akun[i] if i < len(kolom_akun) else ""
+        jumlah = kolom_jumlah[i] if i < len(kolom_jumlah) else 0
+        deskripsi = kolom_deskripsi[i] if i < len(kolom_deskripsi) else ""
+
+        jumlah_num = jumlah if isinstance(jumlah, (int, float)) else 0
+        tanda = "-" if tipe == "Out" else "+"
+        baris = f"{tanda}{format_rp(jumlah_num)} | {kategori} ({akun})"
+        if deskripsi:
+            baris += f" - {deskripsi}"
+        baris_hasil.append(baris)
+
+        if tipe == "Out":
+            total_out += jumlah_num
+        else:
+            total_in += jumlah_num
+
+    label_tanggal = hari_ini.strftime("%d/%m/%Y")
+    if not baris_hasil:
+        await update.message.reply_text(f"Belum ada transaksi tercatat hari ini ({label_tanggal}).")
+        return
+
+    pesan = f"🗓️ Transaksi Hari Ini ({label_tanggal}):\n\n" + "\n".join(baris_hasil)
+    pesan += f"\n\nTotal masuk: {format_rp(total_in)}\nTotal keluar: {format_rp(total_out)}"
+    await update.message.reply_text(pesan)
+
+
 async def catat_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     teks = update.message.text
     data, error = parse_pesan(teks)
@@ -219,6 +309,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
     app.add_handler(CommandHandler("ringkasan", cmd_ringkasan))
+    app.add_handler(CommandHandler("hariini", cmd_hariini))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catat_transaksi))
 
     print("Bot berjalan... tekan Ctrl+C untuk berhenti.")
