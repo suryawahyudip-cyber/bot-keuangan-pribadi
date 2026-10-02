@@ -5,7 +5,17 @@
 
 import os
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+WIB = ZoneInfo("Asia/Jakarta")
+
+
+def tanggal_wib():
+    """Tanggal 'hari ini' menurut waktu Indonesia (WIB), bukan waktu server.
+    Server (Railway) biasanya pakai UTC, yang bisa beda hari dengan WIB
+    terutama dini hari (00:00-06:59 WIB = masih hari sebelumnya di UTC)."""
+    return datetime.now(WIB).date()
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -112,7 +122,7 @@ def parse_pesan(teks):
         return None, f"Akun '{akun_input}' tidak dikenali. Akun tersedia: {', '.join(daftar_akun)}"
 
     return {
-        "tanggal": date.today().strftime("%Y-%m-%d"),
+        "tanggal": tanggal_wib().strftime("%Y-%m-%d"),
         "tipe": tipe,
         "kategori": kategori_cocok,
         "akun": akun_cocok,
@@ -245,7 +255,7 @@ async def cmd_hariini(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Gagal ambil data transaksi: {e}")
         return
 
-    hari_ini = date.today()
+    hari_ini = tanggal_wib()
     baris_hasil = []
     total_in = 0
     total_out = 0
