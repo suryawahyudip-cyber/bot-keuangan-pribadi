@@ -5,8 +5,18 @@
 
 import os
 import json
+import asyncio
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+
+import gspread
+import google.generativeai as genai
+from google.oauth2.service_account import Credentials
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from dotenv import load_dotenv
+
+load_dotenv()  # baca file .env kalau ada (untuk development di laptop)
 
 WIB = ZoneInfo("Asia/Jakarta")
 
@@ -17,17 +27,17 @@ def tanggal_wib():
     terutama dini hari (00:00-06:59 WIB = masih hari sebelumnya di UTC)."""
     return datetime.now(WIB).date()
 
-import gspread
-from google.oauth2.service_account import Credentials
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from dotenv import load_dotenv
-
-load_dotenv()  # baca file .env kalau ada (untuk development di laptop)
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 SHEET_ID = os.environ["SHEET_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # opsional - tanpa ini, bot tetap jalan pakai format kaku saja
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model_ai = genai.GenerativeModel("gemini-2.5-flash-lite")
+else:
+    model_ai = None
 
 
 # --- Setup koneksi ke Google Sheets (dijalankan sekali saat bot mulai) ---
@@ -155,7 +165,7 @@ def format_rp(angka):
 # --- Handler bot Telegram ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    pesan = (
         "Halo! Kirim transaksi dengan format:\n"
         "<kategori> <jumlah> <akun> <deskripsi opsional>\n\n"
         "Contoh: makan 15000 bca beli nasi goreng\n\n"
@@ -164,6 +174,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ringkasan - rekap bulan ini\n"
         "/hariini - transaksi hari ini"
     )
+    if model_ai is not None:
+        pesan += (
+            "\n\nAtau tulis bebas juga bisa, contoh:\n"
+            "\"td abis makan siang di warung 25rb pake bca\" 🤖"
+        )
+    await update.message.reply_text(pesan)
 
 
 async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -222,6 +238,78 @@ async def cmd_ringkasan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pesan += "\n\nPer Kategori:\n" + "\n".join(baris_kategori)
 
     await update.message.reply_text(pesan)
+
+
+async def parse_dengan_ai(teks, daftar_pengeluaran, daftar_pemasukan, daftar_akun):
+    """Minta Gemini mengekstrak data transaksi dari pesan bebas (bahasa natural).
+    Return dict mentah dari AI, atau None kalau gagal/AI tidak tersedia."""
+    if model_ai is None:
+        return None
+
+    prompt = f"""Kamu mengekstrak data transaksi keuangan dari pesan santai berbahasa Indonesia.
+
+Kategori pengeluaran yang valid: {", ".join(daftar_pengeluaran)}
+Sumber pemasukan yang valid: {", ".join(daftar_pemasukan)}
+Akun yang valid: {", ".join(daftar_akun)}
+
+Pesan dari user: "{teks}"
+
+Balas HANYA dengan JSON murni (tanpa markdown, tanpa teks lain), format:
+{{"kategori": "<salah satu dari daftar di atas, tulis persis sama>", "jumlah": <angka saja tanpa titik/koma>, "akun": "<salah satu dari daftar akun di atas, tulis persis sama>", "deskripsi": "<ringkasan singkat konteks pesan, boleh string kosong>"}}
+
+Kalau kategori, jumlah, atau akun tidak bisa ditentukan dengan yakin dari pesan, balas:
+{{"error": "<alasan singkat dalam Bahasa Indonesia>"}}"""
+
+    try:
+        respons = await asyncio.to_thread(model_ai.generate_content, prompt)
+        teks_respons = respons.text.strip()
+        teks_respons = teks_respons.replace("```json", "").replace("```", "").strip()
+        data = json.loads(teks_respons)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict) or "error" in data:
+        return None
+
+    return data
+
+
+def validasi_hasil_ai(data_ai, daftar_pengeluaran, daftar_pemasukan, daftar_akun):
+    """Hasil AI tidak langsung dipercaya - tetap divalidasi ke daftar kategori/akun
+    asli di sheet, sama seperti jalur parsing format kaku."""
+    kategori_mentah = str(data_ai.get("kategori", "")).strip()
+    kategori_cocok = cari_kecocokan(kategori_mentah, daftar_pengeluaran)
+    if kategori_cocok:
+        tipe = "Out"
+    else:
+        kategori_cocok = cari_kecocokan(kategori_mentah, daftar_pemasukan)
+        tipe = "In" if kategori_cocok else None
+
+    if not kategori_cocok:
+        return None, f"AI menyebut kategori '{kategori_mentah}' yang tidak ada di daftar kamu."
+
+    akun_mentah = str(data_ai.get("akun", "")).strip()
+    akun_cocok = cari_kecocokan(akun_mentah, daftar_akun)
+    if not akun_cocok:
+        return None, f"AI menyebut akun '{akun_mentah}' yang tidak ada di daftar kamu."
+
+    try:
+        jumlah = int(float(data_ai.get("jumlah", 0)))
+    except (TypeError, ValueError):
+        jumlah = 0
+    if jumlah <= 0:
+        return None, "AI tidak berhasil menentukan jumlah transaksi dengan jelas."
+
+    deskripsi = str(data_ai.get("deskripsi", "")).strip()
+
+    return {
+        "tanggal": tanggal_wib().strftime("%Y-%m-%d"),
+        "tipe": tipe,
+        "kategori": kategori_cocok,
+        "akun": akun_cocok,
+        "jumlah": jumlah,
+        "deskripsi": deskripsi,
+    }, None
 
 
 def serial_ke_tanggal(nilai):
@@ -296,7 +384,23 @@ async def cmd_hariini(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def catat_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     teks = update.message.text
-    data, error = parse_pesan(teks)
+    data, error = parse_pesan(teks)  # coba format kaku dulu - instan & gratis, tidak pakai kuota AI
+    dibantu_ai = False
+
+    if error and model_ai is not None:
+        # format kaku gagal - coba pesan natural lewat AI sebagai fallback
+        daftar_pengeluaran = ambil_daftar(ws_kategori, 1)
+        daftar_pemasukan = ambil_daftar(ws_kategori, 3)
+        daftar_akun = ambil_daftar(ws_akun, 1)
+
+        data_ai = await parse_dengan_ai(teks, daftar_pengeluaran, daftar_pemasukan, daftar_akun)
+        if data_ai:
+            data_valid, error_ai = validasi_hasil_ai(data_ai, daftar_pengeluaran, daftar_pemasukan, daftar_akun)
+            if data_valid:
+                data, error = data_valid, None
+                dibantu_ai = True
+            else:
+                error = error_ai
 
     if error:
         await update.message.reply_text(f"⚠️ {error}")
@@ -309,8 +413,9 @@ async def catat_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tanda = "-" if data["tipe"] == "Out" else "+"
+    prefiks = "🤖 " if dibantu_ai else "✅ "
     await update.message.reply_text(
-        f"✅ Tercatat: {data['kategori']} {tanda}Rp{data['jumlah']:,} ({data['akun']})"
+        f"{prefiks}Tercatat: {data['kategori']} {tanda}Rp{data['jumlah']:,} ({data['akun']})"
     )
 
 
