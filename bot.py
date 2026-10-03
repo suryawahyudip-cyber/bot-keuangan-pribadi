@@ -35,7 +35,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # opsional - tanpa ini, bot t
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model_ai = genai.GenerativeModel("gemini-2.5-flash-lite")
+    model_ai = genai.GenerativeModel("gemini-3.5-flash-lite")
 else:
     model_ai = None
 
