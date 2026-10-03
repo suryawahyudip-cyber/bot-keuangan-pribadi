@@ -244,6 +244,7 @@ async def parse_dengan_ai(teks, daftar_pengeluaran, daftar_pemasukan, daftar_aku
     """Minta Gemini mengekstrak data transaksi dari pesan bebas (bahasa natural).
     Return dict mentah dari AI, atau None kalau gagal/AI tidak tersedia."""
     if model_ai is None:
+        print("[AI] model_ai None - GEMINI_API_KEY kemungkinan tidak terbaca saat bot start")
         return None
 
     prompt = f"""Kamu mengekstrak data transaksi keuangan dari pesan santai berbahasa Indonesia.
@@ -265,7 +266,8 @@ Kalau kategori, jumlah, atau akun tidak bisa ditentukan dengan yakin dari pesan,
         teks_respons = respons.text.strip()
         teks_respons = teks_respons.replace("```json", "").replace("```", "").strip()
         data = json.loads(teks_respons)
-    except Exception:
+    except Exception as e:
+        print(f"[AI] Gagal parsing dengan AI: {type(e).__name__}: {e}")
         return None
 
     if not isinstance(data, dict) or "error" in data:
